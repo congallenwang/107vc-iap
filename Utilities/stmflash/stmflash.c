@@ -123,7 +123,7 @@ void STMFLASH_Write(u32 WriteAddr,u16 *pBuffer,u16 NumToWrite)
 	u32 offaddr;   //去掉0X08000000后的地址
 	int rem,done;
 
-       if(WriteAddr<STM32_FLASH_BASE||(WriteAddr>=(STM32_FLASH_BASE+1024*128)))
+       if(WriteAddr<STM32_FLASH_BASE||(WriteAddr>=(STM32_FLASH_BASE+1024*256)))
             return;//非法地址
 
 	STMFLASH_Unlock();	//解锁

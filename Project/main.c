@@ -64,8 +64,10 @@ uint8_t  count;
      #define  sFLASH_ID              0xEF4015            //GigaDevice SPI_Flash  GD25Q16B
      #define  FLASH_WriteAddress     0x000000
      #define  FLASH_ReadAddress      FLASH_WriteAddress
+     #define  BUF_SIZE 2048  //2//  2K SIZE
+
      uint8_t  Tx_Buffer[256];
-     uint8_t  Rx_Buffer[256];
+     uint8_t  Rx_Buffer[BUF_SIZE];
      uint32_t Manufact_ID = 0;
      uint32_t DeviceID = 0;
 	 uint16_t i = 0;
@@ -148,7 +150,9 @@ extern const unsigned char image1[];
 #define FLASH_APP1_ADDR		0x08005000  	//第一个应用程序起始地址(存放在FLASH)
 typedef  void (*iapfun)(void);				//定义一个函数类型的参数.   
 iapfun jump2app; 
-u16 iapbuf[512];   
+//  2k size
+#define IAP_SIZE 1024
+u16 iapbuf[IAP_SIZE];   
 //appxaddr:应用程序的起始地址
 //appbuf:应用程序CODE.
 //appsize:应用程序大小(字节).
@@ -166,11 +170,11 @@ void iap_write_appbin(u32 appxaddr,u8 *appbuf,u32 appsize)//2556
 		temp+=(u16)dfu[0];	  
 		dfu+=2;//偏移2个字节
 		iapbuf[i++]=temp;	    
-		if(i==512)
+		if(i==IAP_SIZE)
 		{
 			i=0;
-			STMFLASH_Write(fwaddr,iapbuf,512);	
-			fwaddr+=1024;//偏移1024 16=2*8.所以要乘以2.
+			STMFLASH_Write(fwaddr,iapbuf,IAP_SIZE);	
+			fwaddr+=(IAP_SIZE*2);//偏移1024 16=2*8.所以要乘以2.
 		}
 	}
 
@@ -202,20 +206,52 @@ void iap_load_app(u32 appxaddr)
 		MSR_MSP(*(vu32*)appxaddr);					//初始化APP堆栈指针(用户代码区的第一个字用于存放栈顶地址)
 		jump2app();									//跳转到APP.
 	}
+       else
+       {
+            printf("wrong stack addr\r\n");
+       }
 }	
 
 
-#define APP_OFFSET 0x200000
+u8 Uart1_GetChar(void)
+{
+	u8 RxData=0; //初始化存放接收的字符串
+	
+	//USART_IT_RXNE为中断处理方式
+	if(USART_GetFlagStatus(USART1, USART_FLAG_RXNE) != RESET)//查询处理方式 
+	{
+            RxData = USART_ReceiveData(USART1);	//从串口1获取接收的数据
+            USART_SendData(USART1, RxData);              
+       }
+	return RxData;
+}
+
+//allen
+typedef struct{
+    int flag;
+    int imgsize;
+}IMG_INFO;
+
+
+#define CONFIG_OFFSET 0x1ff000
+#define APP_OFFSET 0x100000
+#define START_OFFSET 0x5000
+#define REMEDY_OFFSET 0x180000
+
 u16 Buffer[512];
 const unsigned char* p_app;
 int app_len;
 
+IMG_INFO g_imginfor;
+
 int main(void)
 {
   uint32_t write_addr;
-  uint8_t flag=0;
+  //uint8_t flag=0;
   int i=0,j;
   int size,total;
+  int flag=1;
+  u8 ch;
   
   RCC_Configuration();
   NVIC_Configuration();
@@ -270,7 +306,9 @@ int main(void)
   {
   	//p_app =(const unsigned char*)rom_data;
 	//app_len= rom_size * 4;
-	app_len= 153600;
+
+       //allen: set size to 200k=204800
+        app_len= 204800;
 
 #if 0
        i = app_len/4096 + 1;
@@ -286,7 +324,33 @@ int main(void)
 #endif
 
 	Delay_100us(10);
-	printf("\n\>>>>>>>>>>>>>>>>>>>>rRead from app_Buffer:\n\r");
+
+      //check if boot from spi flash 
+      printf("******************************************************************\r\n");
+      printf("************Default boot from MCU flash(press no key)************\r\n");
+      printf("************Press 't' to boot from spi flash**********************\r\n");
+      printf("************Press 'r' to load remedy image*********************\r\n");
+      printf("******************************************************************\r\n");
+      while(1)
+      {
+            i++;
+            ch = Uart1_GetChar(); 
+            if('t' == ch)
+            {
+                    //printf("Boot direct from spi Flash");
+                    flag=0;
+                    break;
+            }
+            else if('r' == ch)
+            {
+                    flag = 2;
+                    break;
+            }
+            
+            Delay_100us(100);
+            if(i>250)
+                break;
+      }
 
 /*
 	SPI_FLASH_BufferRead(Rx_Buffer,0x200000, 256);  //从FLASH_ReadAddress处开始,读入BufferSize长度的数据
@@ -311,35 +375,97 @@ int main(void)
 		}
 	}
 */
+
+//default, read image from spi flash,
+if(flag==0)
+{
+     //try read image size from last block;
+     SPI_FLASH_BufferRead(Rx_Buffer,CONFIG_OFFSET, 256);  //从FLASH_ReadAddress处开始,读入BufferSize长度的数据
+     memcpy(&g_imginfor,Rx_Buffer,sizeof(g_imginfor));
+
+
+      app_len= (g_imginfor.imgsize/BUF_SIZE + 1)*BUF_SIZE;
+      printf("read image from SPI flash\r\n");
+      printf("\n\>>>>>>>>>>>>>>>>>>>>rRead from app_Buffer,size=%d,round_size=%d:\n\r",g_imginfor.imgsize,app_len);
+
+	//copy from spi flash to stmflash
+	i=0; total=0;
+	while(1)
+	{
+		size = BUF_SIZE;
+		//if(total+BUF_SIZE>app_len)
+		//	size = app_len -total;
+		SPI_FLASH_BufferRead(Rx_Buffer,APP_OFFSET + i*size, size);  //从FLASH_ReadAddress处开始,读入BufferSize长度的数据
+
+		if(1)
+		{			
+			//copy to stm flash
+			iap_write_appbin(STM32_FLASH_BASE+START_OFFSET+i*size,Rx_Buffer,size);
+		}
+
+		i++;
+		total += size;
+		
+		if(total >= app_len)
+		{
+			printf("size=%d,page=%d\r\n",size,i);
+/*
+            for(j=0; j<BUF_SIZE; j++)    //填充Tx_Buffer缓冲区
+            {
+                printf("0x%02X ",Rx_Buffer[j]);
+                if(j%16 == 15)
+                {
+                    printf("\n\r");
+                }
+            }
+*/
+			break;
+		}
+	}
+
+#if 1
+	printf(">>>>>>>>>>>>>>>>>>>stm flash from 0x%x:\r\n",STM32_FLASH_BASE+START_OFFSET);
+	STMFLASH_Read(STM32_FLASH_BASE+START_OFFSET,Buffer,512);   	
+	for(i=0;i<512;i++)
+	{
+		printf("%04X ",Buffer[i]);
+		if(i%16==15)
+			printf("\r\n");
+	}
+
+     	printf("<<<<<<<<<<<<<<<<<<stm flash from 0x%x:\r\n",STM32_FLASH_BASE+START_OFFSET+(g_imginfor.imgsize/1024)*1024);
+	STMFLASH_Read(STM32_FLASH_BASE+START_OFFSET+(g_imginfor.imgsize/1024)*1024,Buffer,512);   	
+	for(i=0;i<512;i++)
+	{
+		printf("%04X ",Buffer[i]);
+		if(i%16==15)
+			printf("\r\n");
+	}
+ 
+#endif
+}
+else if(flag ==2)
+{
+        printf("load remedy Image from SPI flash\r\n");
+
+        //force remedy img size to 150k to save effort        
+        app_len=150*1024;
+        
+        printf("\n\>>>>>>>>>>>>>>>>>>>>rRead from app_Buffer,size=%d:\n\r",app_len);
 #if 1
 	//copy from spi flash to stmflash
 	i=0; total=0;
 	while(1)
 	{
-		size = 256;
-		if(total+256>app_len)
-			size = app_len -total;
-		SPI_FLASH_BufferRead(Rx_Buffer,0x100000 + i*256, 256);  //从FLASH_ReadAddress处开始,读入BufferSize长度的数据
+		size = BUF_SIZE;
 
-#if 0
-		if(0 )//|| size<256)
-		{
-			printf("dump, i=%d\r\n",i);
-			
-			for(j=0; j<=255; j++)    //将Rx_Buffer中的数据通过串口打印
-			{	
-				printf("0x%02X ", Rx_Buffer[j]);
-				if(j%16 == 15)
-				{
-					 printf("\n\r");
-				}
-			}
-		}
-#endif
+              //remedy image start from 1.5M
+		SPI_FLASH_BufferRead(Rx_Buffer,REMEDY_OFFSET + i*size, size);  //从FLASH_ReadAddress处开始,读入BufferSize长度的数据
+
 		if(1)
 		{			
 			//copy to stm flash
-			iap_write_appbin(STM32_FLASH_BASE+0x5000+i*256,Rx_Buffer,size);
+			iap_write_appbin(STM32_FLASH_BASE+START_OFFSET+i*size,Rx_Buffer,size);
 		}
 
 		i++;
@@ -353,23 +479,31 @@ int main(void)
 	}
 #endif
 
-#if 0  
-	//read internal flash
-	printf(">>>>>>>>>>>>>>>>>>>>>stm flash from 0:\r\n");
-	STMFLASH_Read(STM32_FLASH_BASE,Buffer,512);   	
+
+
+}
+else
+{
+       printf("start from MCU flash\r\n");
+
+       //try read image size from last block;
+       SPI_FLASH_BufferRead(Rx_Buffer,CONFIG_OFFSET, 256);  //从FLASH_ReadAddress处开始,读入BufferSize长度的数据
+       memcpy(&g_imginfor,Rx_Buffer,sizeof(g_imginfor));
+
+       
+       app_len= (g_imginfor.imgsize/256 + 1)*256;
+
+       printf(">>>>>>>>>>>>>>>>>>>stm flash from 0x%x:\r\n",STM32_FLASH_BASE+START_OFFSET);
+	STMFLASH_Read(STM32_FLASH_BASE+START_OFFSET,Buffer,512);   	
 	for(i=0;i<512;i++)
 	{
 		printf("%04X ",Buffer[i]);
 		if(i%16==15)
 			printf("\r\n");
 	}
-#endif
 
-#if 0
-for(j=0;j<5;j++)
-{
-	printf(">>>>>>>>>>>>>>>>>>>stm flash from 0x%x:\r\n",STM32_FLASH_BASE+0x5000+j*sizeof(Buffer));
-	STMFLASH_Read(STM32_FLASH_BASE+0x5000+j*sizeof(Buffer),Buffer,512);   	
+     	printf("<<<<<<<<<<<<<<<<<<stm flash from 0x%x:\r\n",STM32_FLASH_BASE+START_OFFSET+app_len-1024);
+	STMFLASH_Read(STM32_FLASH_BASE+START_OFFSET+app_len-1024,Buffer,512);   	
 	for(i=0;i<512;i++)
 	{
 		printf("%04X ",Buffer[i]);
@@ -377,18 +511,6 @@ for(j=0;j<5;j++)
 			printf("\r\n");
 	}
 }
-#endif
-
-#if 1
-	printf(">>>>>>>>>>>>>>>>>>>stm flash from 0x%x:\r\n",STM32_FLASH_BASE+0x5000);
-	STMFLASH_Read(STM32_FLASH_BASE+0x5000,Buffer,512);   	
-	for(i=0;i<512;i++)
-	{
-		printf("%04X ",Buffer[i]);
-		if(i%16==15)
-			printf("\r\n");
-	}
-#endif
 	printf("\n\r>>>>>>>>>>>>>>>>>>>>>>>jump to app<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<\n\r");
 
 	iap_load_app(FLASH_APP1_ADDR);
@@ -500,6 +622,9 @@ void Turn_On_LED(uint8_t LED_NUM)	           /*点亮对应灯*/
           break;
 	}
 }
+
+
+
 
 /**
   * @brief  Retargets the C library printf function to the USART.
